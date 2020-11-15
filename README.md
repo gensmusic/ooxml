@@ -14,3 +14,14 @@ misc/*.pdf  # ECMA-376 5th 的 part1, part4资料
 demo.docx   # 一个 docx 的测试文档
 demo        # demo.docx 使用 zip 解压缩后的目录
 ```
+
+## 程序运行
+
+在程序根目录下运行,接收一个参数 `docx`文件名.
+
+```shell script
+cargo run -- demo.docx
+
+# 查看其它参数
+cargo run -- -h
+```
