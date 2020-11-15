@@ -23,7 +23,6 @@ struct Opt {
     verbose: bool,
 }
 
-/// 简单版本:
 /// 运行
 /// ```sh
 /// cargo run -- demo.docx
@@ -52,7 +51,7 @@ fn main() -> Result<()> {
         .context("found no word/document.xml")?;
 
     // xml parse
-    let mut doc_parsing = Parsing::new();
+    let mut doc_parsing = MainDocParsing::new();
     let parser = EventReader::new(word_doc);
     let mut depth = 0;
     for e in parser {
@@ -63,39 +62,47 @@ fn main() -> Result<()> {
                 attributes,
                 namespace: _,
             } => {
+                // 调试信息
                 if opt.verbose {
                     print_xml_owned_name(&name, depth, true);
                 }
                 depth += 1;
+
+                // 新元素开始解析
                 doc_parsing.feed_element(name, attributes);
             }
             XmlEvent::EndElement { name } => {
                 depth -= 1;
+                // 调试信息
                 if opt.verbose {
                     print_xml_owned_name(&name, depth, false);
                 }
+                // 当前元素解析完成
                 doc_parsing.fish_feed_element();
             }
-            XmlEvent::Comment(ref data) => {}
-            XmlEvent::CData(ref data) => {}
+            XmlEvent::Comment(_) => {}
+            XmlEvent::CData(_) => {}
             XmlEvent::Characters(data) => {
-                println!(
-                    r#"{}Characters("{}")"#,
-                    " ".repeat(depth),
-                    data.escape_debug()
-                );
+                // 调试信息
+                if opt.verbose {
+                    println!(r#"{}Characters("{}")"#, " ".repeat(depth), data,);
+                }
+                // 当前元素添加 text data
                 doc_parsing.feed_characters(data);
             }
-            XmlEvent::Whitespace(ref data) => {}
+            XmlEvent::Whitespace(_) => {}
             _ => {
                 // TODO
             }
         }
     }
-    print_elements(&doc_parsing.root);
+    // 打印 文中的字体颜色和字体内容
+    print_elements(&doc_parsing.root, opt.verbose);
+
     Ok(())
 }
 
+/// 辅助调试函数,打印元素
 fn print_xml_owned_name(name: &OwnedName, indent: usize, start: bool) {
     print!("{}", " ".repeat(indent));
     if start {
@@ -109,6 +116,8 @@ fn print_xml_owned_name(name: &OwnedName, indent: usize, start: bool) {
     println!("{}", name.local_name);
 }
 
+/// Main document 中我们支持的一些元素类型
+/// 保存原始的格式(例如 w:t)到 String 只是为了方便调试.
 #[derive(Debug)]
 enum ElementType {
     Document(String),
@@ -125,16 +134,17 @@ enum ElementType {
     Unknown(String),
 }
 impl ElementType {
+    /// 从 xml的 OwnedName 中构建 ElementType
     fn from_name(name: &OwnedName) -> Self {
         let raw = format!(
             "{}:{}",
             name.prefix.as_ref().unwrap_or(&String::new()),
             name.local_name
         );
+        // 目前 只识别  `w:xxx` 格式, 且只是部分标签
         if name.prefix.is_none() || name.prefix.as_ref().unwrap().ne("w") {
             return Self::Unknown(raw);
         }
-        // 只匹配 w:x
         match &*name.local_name {
             "document" => Self::Document(raw),
             "body" => Self::Body(raw),
@@ -147,25 +157,22 @@ impl ElementType {
             _ => Self::Unknown(raw),
         }
     }
+
+    /// 是否是 Text类型(w:t)
     fn is_text(&self) -> bool {
-        match self {
-            Self::Text(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Text(_))
     }
+    /// 是否是Run property(w:rPr)
     fn is_run_property(&self) -> bool {
-        match self {
-            Self::RunProperty(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::RunProperty(_))
     }
+    /// 是否是 Color 类型(color)
     fn is_color(&self) -> bool {
-        match self {
-            Self::Color(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Color(_))
     }
 }
+
+/// main document中的元素.
 struct Element {
     element_type: ElementType,
     parent: Option<Weak<RefCell<Element>>>,
@@ -174,6 +181,7 @@ struct Element {
     literal_text: Option<String>, // 目前只有  w:t 有
     depth: usize,                 // for debug
 }
+
 impl Element {
     /// new Element, 需要指定 parent 和 type, parent 可以为 None
     fn new(
@@ -223,20 +231,17 @@ impl Element {
     fn get_color(element: &Option<Rc<RefCell<Element>>>) -> Option<String> {
         if let Some(ele) = &element {
             // 本身不是 run property
-            if ele.borrow().element_type.is_run_property() {
-                println!("+++ type not run pr");
+            if !ele.borrow().element_type.is_run_property() {
                 return None;
             }
             // 从 children 中寻找 w:color
             for child in ele.borrow().children.iter() {
                 let child_ref = child.borrow();
                 if child_ref.element_type.is_color() {
-                    return child_ref.attributes.get("val").map(|v| v.clone());
+                    return child_ref.attributes.get("val").cloned();
                 }
             }
-            println!("+++ no color child");
         }
-        println!("+++ none run pr");
         None
     }
 
@@ -246,7 +251,7 @@ impl Element {
                 .borrow()
                 .attributes
                 .iter()
-                .map(|(k, v)| format!("{}={},", k, v))
+                .map(|(k, v)| format!("{}={}", k, v))
                 .collect();
             let indent = "  ".repeat(root_rc.borrow().depth);
             format!(
@@ -261,13 +266,23 @@ impl Element {
     }
 }
 
-struct Parsing {
+/// Main document 解析过程.
+/// 流程:
+/// 内部维护一颗 Element 的树 root, 并且维护当前解析的节点的指针 cur.
+/// 1. 当新的元素解析到,调用 feed_element, 会将新的 Element 添加到 cur 的子元素中(children),
+///     并将 cur 指向新的 Element
+/// 2. 当一个元素解析完成,调用 fish_feed_element,
+///     会将 cur 指向其父节点
+/// 3. 当有新的 text data 时,调用 feed_characters, 将 data 填空到当前的 Element中.
+///     目前只是针对 w:t 类型
+struct MainDocParsing {
     // 这里假设有一个唯一的 root
     root: Option<Rc<RefCell<Element>>>,
     cur: Option<Rc<RefCell<Element>>>,
     depth: usize,
 }
-impl Parsing {
+
+impl MainDocParsing {
     fn new() -> Self {
         Self {
             root: None,
@@ -275,26 +290,11 @@ impl Parsing {
             depth: 0,
         }
     }
+    /// 一个新的元素开始解析
     fn feed_element(&mut self, name: OwnedName, attributes: Vec<OwnedAttribute>) {
         self.depth += 1;
 
         let element_type = ElementType::from_name(&name);
-
-        // TODO remove me
-        if name.local_name.ne("r") {
-            let attrs: Vec<_> = attributes
-                .iter()
-                .map(|a| format!("{}={}", a.name.local_name, a.value))
-                .collect();
-            println!(
-                "{}{}, Type:{:?}, attributes: {:?}",
-                " ".repeat(self.depth),
-                name.local_name,
-                element_type,
-                attrs
-            );
-        }
-
         let element = Rc::new(RefCell::new(Element::new(
             element_type,
             &self.cur,
@@ -312,6 +312,7 @@ impl Parsing {
             self.cur.replace(element);
         }
     }
+    /// 当前元素解析完成
     fn fish_feed_element(&mut self) {
         self.depth -= 1;
 
@@ -319,15 +320,14 @@ impl Parsing {
         let mut parent = None;
         if let Some(cur) = &self.cur {
             if let Some(p) = &cur.borrow().parent {
-                if let v = p.upgrade() {
-                    parent = v;
-                }
+                parent = p.upgrade();
             }
         }
 
         self.cur = parent;
     }
-    /// 目前只有 w:t 类型会有
+
+    /// 向当前的 element 中添加text, 目前只有 w:t 类型会有
     fn feed_characters(&mut self, data: String) {
         if let Some(cur) = &self.cur {
             cur.borrow_mut().literal_text = Some(data);
@@ -335,8 +335,11 @@ impl Parsing {
     }
 }
 
-fn print_elements(root: &Option<Rc<RefCell<Element>>>) {
-    println!("{}", Element::display(root));
+fn print_elements(root: &Option<Rc<RefCell<Element>>>, verbose: bool) {
+    if verbose {
+        println!("{}", Element::display(root));
+    }
+
     if let Some(root_rc) = root {
         if root_rc.borrow().element_type.is_text() {
             let run_property = Element::find_run_property(&root);
@@ -345,15 +348,12 @@ fn print_elements(root: &Option<Rc<RefCell<Element>>>) {
                 .borrow()
                 .literal_text
                 .as_ref()
-                .map(|v| v.clone())
+                .cloned()
                 .unwrap_or_default();
-            println!("text: {}", text);
-            if let Some(run_pr) = run_property {
-                println!("----has run property---{:?}", color_val);
-            }
+            println!("[color={}], text: {}", color_val.unwrap_or_default(), text);
         }
         for child in root_rc.borrow().children.iter() {
-            print_elements(&Some(Rc::clone(child)));
+            print_elements(&Some(Rc::clone(child)), verbose);
         }
     }
 }
